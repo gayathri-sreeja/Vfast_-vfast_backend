@@ -2,7 +2,7 @@ import random
 
 import boto3
 import botocore.exceptions
-from Config.const import OTP_HTML, BOOKING_CONFIRMATION_HTML_FAIL, BOOKING_CONFIRMATION_HTML_SUCCESS
+from Config.email_templates import OTP_HTML, BOOKING_CONFIRMATION_HTML_FAIL, BOOKING_CONFIRMATION_HTML_SUCCESS
 from Config.secrets import settings
 import smtplib
 from email.mime.text import MIMEText
