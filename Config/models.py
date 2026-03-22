@@ -187,10 +187,13 @@ class BookingRequest(Base):
     last_name = Column(String(255))
     email = Column(String(255), nullable=False)
     phone_number = Column(String(20))
+    gender = Column(String(20))
+    nationality = Column(String(100), default='Indian')
     
     check_in = Column(Date, nullable=False, index=True)
     check_out = Column(Date, nullable=False, index=True)
     pax = Column(Integer, nullable=False)
+    room_count = Column(Integer, default=1)
     room_type_id = Column(Integer, ForeignKey("vfast.room_types.id"))
     
     booking_type = Column(String(50), nullable=False, index=True)

@@ -107,6 +107,89 @@ async def user_google_signin(
 
 
 # ──────────────────────────────────────────────
+# BITS Email Login
+# ──────────────────────────────────────────────
+
+class BitsLoginRequest(BaseModel):
+    email: str
+    user_type: str  # 'STUDENT' or 'FACULTY'
+
+
+@router.post("/bits-login", summary="Login with BITS Pilani email")
+async def bits_login(
+    body: BitsLoginRequest,
+    db: Session = Depends(get_db)
+):
+    """
+    Login with BITS Pilani email address.
+    - Creates user if not exists
+    - Returns JWT token
+    - user_type determined by frontend based on email pattern
+    """
+    email = body.email.strip().lower()
+    user_type = body.user_type.upper()
+    
+    # Validate domain
+    if not email.endswith('@pilani.bits-pilani.ac.in'):
+        raise HTTPException(status_code=400, detail="Only BITS Pilani emails are allowed")
+    
+    # Validate user_type
+    if user_type not in ['STUDENT', 'FACULTY']:
+        raise HTTPException(status_code=400, detail="Invalid user type")
+    
+    # Extract name from email
+    local_part = email.split('@')[0]
+    # Convert email part to name (e.g., "h20241234" -> "H20241234", "meera.iyer" -> "Meera Iyer")
+    if '.' in local_part:
+        name = ' '.join(word.capitalize() for word in local_part.split('.'))
+    else:
+        name = local_part.upper() if user_type == 'STUDENT' else local_part.capitalize()
+    
+    # Find or create user
+    user = db.query(User).filter(User.email == email).first()
+    
+    if not user:
+        user = User(
+            email      = email,
+            name       = name,
+            user_type  = user_type,
+            is_active  = True,
+            last_login = datetime.utcnow(),
+        )
+        db.add(user)
+        logger.info(f"✅ New {user_type} user created: {email}")
+    else:
+        user.last_login = datetime.utcnow()
+        # Update user_type if changed (shouldn't happen normally)
+        if user.user_type != user_type:
+            user.user_type = user_type
+    
+    db.commit()
+    db.refresh(user)
+    
+    token = create_access_token(
+        data={"sub": str(user.id), "email": user.email, "scope": "user"},
+        expires_delta=timedelta(hours=24),
+        scope="user",
+    )
+    
+    logger.info(f"🔑 BITS login: {email} ({user_type})")
+    
+    return {
+        "status": "success",
+        "data": {
+            "access_token": token,
+            "user": {
+                "id":        user.id,
+                "email":     user.email,
+                "name":      user.name,
+                "user_type": user.user_type,
+            }
+        }
+    }
+
+
+# ──────────────────────────────────────────────
 # DEV Login — local testing only
 # ──────────────────────────────────────────────
 
