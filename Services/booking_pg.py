@@ -44,9 +44,12 @@ class SubmitBookingRequest(BaseModel):
     last_name: Optional[str] = ""
     email: str
     phone_number: Optional[str] = ""
+    gender: Optional[str] = ""
+    nationality: Optional[str] = "Indian"
     check_in: str           # "YYYY-MM-DD"
     check_out: str          # "YYYY-MM-DD"
     pax: int
+    room_count: Optional[int] = 1
     room_type_id: int
     booking_type: Optional[str] = "STUDENT"
     is_international: Optional[bool] = False
@@ -260,6 +263,18 @@ async def submit_booking(
     if total > 0 and occupied >= total:
         raise HTTPException(409, "No rooms available for selected dates")
 
+    # ── Determine initial status ────────────────────────────────
+    # Faculty Professional with room_count > 2 OR non-Indian nationality requires Dean approval first
+    room_count = body.room_count or 1
+    booking_type = body.booking_type or "STUDENT"
+    nationality = body.nationality or "Indian"
+    is_non_indian = nationality.lower() != "indian"
+    requires_dean = (
+        booking_type == 'FACULTY_PROFESSIONAL' and 
+        (room_count > 2 or is_non_indian)
+    )
+    initial_status = "PENDING_DEAN" if requires_dean else "PENDING"
+
     # ── Create booking record ──────────────────────────────────
     booking = BookingRequest(
         user_id              = user.id,
@@ -271,14 +286,17 @@ async def submit_booking(
         check_out            = co,
         pax                  = body.pax,
         room_type_id         = body.room_type_id,
-        booking_type         = body.booking_type or "STUDENT",
-        is_international     = body.is_international,
+        booking_type         = booking_type,
+        is_international     = body.is_international or is_non_indian,
         is_bulk              = body.is_bulk,
         purpose_of_visit     = body.purpose_of_visit or "",
         special_requirements = body.special_requirements or "",
         gst_number           = body.gst_number or "",
         relation_to_campus   = body.relation_to_campus or "",
-        status               = "PENDING",
+        gender               = body.gender or "",
+        nationality          = nationality,
+        room_count           = room_count,
+        status               = initial_status,
         submitted_at         = datetime.utcnow(),
         created_at           = datetime.utcnow(),
         updated_at           = datetime.utcnow(),
@@ -287,11 +305,12 @@ async def submit_booking(
     db.flush()   # get id
 
     # ── Write history entry ────────────────────────────────────
+    history_note = "Booking submitted - Requires Dean approval" if requires_dean else "Booking submitted by guest"
     history = BookingHistory(
         booking_request_id = booking.id,
         status_from        = None,
-        status_to          = "PENDING",
-        notes              = "Booking submitted by guest",
+        status_to          = initial_status,
+        notes              = history_note,
         changed_at         = datetime.utcnow(),
     )
     db.add(history)
@@ -299,11 +318,12 @@ async def submit_booking(
     db.commit()
     db.refresh(booking)
 
-    logger.info(f"✅ Booking #{booking.id} created for user {user.email}")
+    status_message = "Reservation submitted. Requires Dean approval first." if requires_dean else "Reservation submitted successfully"
+    logger.info(f"✅ Booking #{booking.id} created for user {user.email} (status: {initial_status})")
 
     return {
         "status": "success",
-        "message": "Reservation submitted successfully",
+        "message": status_message,
         "data": {
             "booking_id":  booking.id,
             "status":      booking.status,

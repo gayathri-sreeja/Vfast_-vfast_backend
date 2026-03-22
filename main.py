@@ -9,6 +9,7 @@ from Services.admin_auth import router as admin_auth_router
 from Services.booking_pg import router as booking_router
 from Services.user_auth import router as user_auth_router
 from Services.operator import router as operator_router
+from Services.manager import router as manager_router
 from Config.environment import APP_CONFIG
 
 # Setup logging
@@ -114,6 +115,8 @@ app.include_router(user_auth_router, prefix="/api/v1")
 logger.info("✅ User auth router included")
 app.include_router(operator_router, prefix="/api/v1/admin")
 logger.info("✅ Operator router included")
+app.include_router(manager_router, prefix="/api/v1/admin")
+logger.info("✅ Manager router included")
 
 # Error handlers
 @app.exception_handler(Exception)

@@ -52,6 +52,22 @@ def _verify_operator_access(current_user: dict) -> int:
     return current_user.get("admin_id")
 
 
+def _verify_operator_only(current_user: dict) -> int:
+    """Verify user has OPERATOR role specifically (not manager/dean/fic). Returns admin_id."""
+    if current_user.get("scope") != "admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Operator access required"
+        )
+    role = current_user.get("role", "").lower()
+    if role not in ["operator", "admin", "super_admin"]:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only operator login can perform this action"
+        )
+    return current_user.get("admin_id")
+
+
 def _log_admin_action(
     db: Session,
     admin_id: int,
@@ -88,19 +104,35 @@ async def list_operator_bookings(
     current_user: dict = Depends(get_current_user)
 ):
     """
-    List bookings relevant to operator:
-    - Status IN (MANAGER_APPROVED, DEAN_APPROVED, FIC_APPROVED, OPERATOR_ALLOCATED)
-    - Excludes: PENDING, REJECTED, CHECKED_OUT, CANCELLED
+    List bookings relevant to the admin role:
+    - Dean: sees PENDING_DEAN + DEAN_APPROVED + all other statuses
+    - Manager/FIC: sees PENDING + DEAN_APPROVED + all other statuses
+    - Operator: sees MANAGER_APPROVED+ (excludes PENDING, PENDING_DEAN, DEAN_APPROVED)
+    - All: can see REJECTED for reference
     """
     admin_id = _verify_operator_access(current_user)
+    role = current_user.get("role", "").lower()
     
     try:
-        # Operator sees PENDING bookings for approval + already approved for room allocation
+        # Build allowed statuses based on role
+        is_dean_role = role in ['dean', 'admin', 'super_admin']
+        is_manager_role = role in ['manager', 'dean', 'fic', 'admin', 'super_admin']
+        
         allowed_statuses = [
-            'PENDING',  # For accept/reject
-            'MANAGER_APPROVED', 'DEAN_APPROVED', 'FIC_APPROVED',  # Awaiting room
-            'OPERATOR_ALLOCATED', 'CHECKED_IN'  # Already allocated
+            'MANAGER_APPROVED', 'FIC_APPROVED',  # Awaiting operator approval
+            'OPERATOR_APPROVED',  # Approved by operator, ready for room allocation
+            'OPERATOR_ALLOCATED', 'CHECKED_IN',  # Already allocated
+            'REJECTED'  # For reference
         ]
+        
+        # Dean can see PENDING_DEAN
+        if is_dean_role:
+            allowed_statuses.append('PENDING_DEAN')
+        
+        # Managers can see PENDING and DEAN_APPROVED bookings
+        if is_manager_role:
+            allowed_statuses.append('PENDING')
+            allowed_statuses.append('DEAN_APPROVED')
         
         bookings = (
             db.query(BookingRequest)
@@ -147,6 +179,8 @@ async def list_operator_bookings(
                 "check_in": str(b.check_in) if b.check_in else None,
                 "check_out": str(b.check_out) if b.check_out else None,
                 "pax": b.pax,
+                "room_count": b.room_count or 1,
+                "nationality": b.nationality or "Indian",
                 "room_type_id": b.room_type_id,
                 "room_type": room_type.name if room_type else "Unknown",
                 "booking_type": b.booking_type,
@@ -154,7 +188,13 @@ async def list_operator_bookings(
                 "purpose_of_visit": b.purpose_of_visit,
                 "special_requirements": b.special_requirements,
                 "submitted_at": b.submitted_at.isoformat() if b.submitted_at else None,
-                "allocated_room": allocated_room
+                "allocated_room": allocated_room,
+                "manager_rejected_reason": b.manager_rejected_reason,
+                "dean_rejected_reason": b.dean_rejected_reason,
+                "requires_dean_approval": (
+                    b.booking_type == 'FACULTY_PROFESSIONAL' and 
+                    ((b.room_count or 1) > 2 or (b.nationality or 'Indian').lower() != 'indian')
+                )
             })
         
         return {
@@ -468,20 +508,20 @@ async def allocate_room(
         )
         db.add(history)
         
-        # 4. Log admin action
-        _log_admin_action(
-            db=db,
-            admin_id=admin_id,
-            action_type='ALLOCATE',
-            entity_type='BOOKING',
-            entity_id=booking_id,
-            details={
-                "room_id": body.room_id,
-                "room_number": room.room_number,
-                "previous_status": old_status
-            },
-            request=request
-        )
+        # 4. Log admin action (disabled for now)
+        # _log_admin_action(
+        #     db=db,
+        #     admin_id=admin_id,
+        #     action_type='ALLOCATE',
+        #     entity_type='BOOKING',
+        #     entity_id=booking_id,
+        #     details={
+        #         "room_id": body.room_id,
+        #         "room_number": room.room_number,
+        #         "previous_status": old_status
+        #     },
+        #     request=request
+        # )
         
         db.commit()
         
@@ -506,7 +546,7 @@ async def allocate_room(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.post("/bookings/{booking_id}/approve", summary="Approve Booking")
+@router.post("/bookings/{booking_id}/approve", summary="Operator Approve Booking")
 async def approve_booking(
     booking_id: int,
     db: Session = Depends(get_db),
@@ -514,63 +554,65 @@ async def approve_booking(
     request: Request = None
 ):
     """
-    Approve a PENDING booking.
+    Operator approves a MANAGER_APPROVED booking.
     
-    - Updates booking status to MANAGER_APPROVED
+    - Updates booking status to OPERATOR_APPROVED
     - Adds booking_history entry
-    - Logs admin action
+    - Booking is now ready for room allocation or check-in
+    - Only operators can perform this action (not managers)
     """
-    admin_id = _verify_operator_access(current_user)
+    admin_id = _verify_operator_only(current_user)
     
     try:
         booking = db.query(BookingRequest).filter(BookingRequest.id == booking_id).first()
         if not booking:
             raise HTTPException(status_code=404, detail="Booking not found")
         
-        if booking.status != 'PENDING':
+        # Operator can only approve bookings that manager has already approved
+        if booking.status not in ['MANAGER_APPROVED', 'FIC_APPROVED', 'DEAN_APPROVED']:
             raise HTTPException(
                 status_code=400, 
-                detail=f"Only PENDING bookings can be approved. Current status: {booking.status}"
+                detail=f"Only manager-approved bookings can be approved by operator. Current status: {booking.status}"
             )
         
         old_status = booking.status
         
         # Update booking status
-        booking.status = 'MANAGER_APPROVED'
+        booking.status = 'OPERATOR_APPROVED'
         booking.updated_at = datetime.utcnow()
         
         # Add history entry
         history = BookingHistory(
             booking_request_id=booking_id,
             status_from=old_status,
-            status_to='MANAGER_APPROVED',
+            status_to='OPERATOR_APPROVED',
             changed_by=admin_id,
-            notes="Approved by operator",
+            notes="Approved by operator - ready for room allocation",
             changed_at=datetime.utcnow()
         )
         db.add(history)
         
-        # Log admin action
-        _log_admin_action(
-            db=db,
-            admin_id=admin_id,
-            action_type='APPROVE',
-            entity_type='BOOKING',
-            entity_id=booking_id,
-            details={"previous_status": old_status},
-            request=request
-        )
+        # Log admin action (disabled for now)
+        # _log_admin_action(
+        #     db=db,
+        #     admin_id=admin_id,
+        #     action_type='APPROVE',
+        #     entity_type='BOOKING',
+        #     entity_id=booking_id,
+        #     details={"previous_status": old_status},
+        #     request=request
+        # )
         
         db.commit()
         
-        logger.info(f"✅ Booking #{booking_id} approved by admin {admin_id}")
+        logger.info(f"✅ Booking #{booking_id} approved by operator {admin_id}")
         
         return {
             "status": "success",
-            "message": "Booking approved successfully",
+            "message": "Booking approved by operator. Ready for room allocation.",
             "data": {
                 "booking_id": booking_id,
-                "new_status": "MANAGER_APPROVED"
+                "new_status": "OPERATOR_APPROVED"
             }
         }
     
@@ -593,11 +635,14 @@ async def reject_booking(
     """
     Reject a booking with a reason.
     
+    - Manager can reject PENDING bookings
+    - Operator can only reject MANAGER_APPROVED bookings
     - Updates booking status to REJECTED
     - Adds booking_history entry
-    - Logs action in admin_actions_log
     """
     admin_id = _verify_operator_access(current_user)
+    role = current_user.get("role", "").lower()
+    is_manager_role = role in ['manager', 'dean', 'fic', 'admin', 'super_admin']
     
     try:
         if not body.reason or not body.reason.strip():
@@ -610,6 +655,22 @@ async def reject_booking(
         if booking.status == 'REJECTED':
             raise HTTPException(status_code=400, detail="Booking is already rejected")
         
+        # Role-based status validation
+        if is_manager_role:
+            # Managers can reject PENDING or MANAGER_APPROVED
+            if booking.status not in ['PENDING', 'MANAGER_APPROVED', 'FIC_APPROVED', 'DEAN_APPROVED']:
+                raise HTTPException(
+                    status_code=400, 
+                    detail="Cannot reject a booking in this status"
+                )
+        else:
+            # Operators can only reject MANAGER_APPROVED
+            if booking.status not in ['MANAGER_APPROVED', 'FIC_APPROVED', 'DEAN_APPROVED']:
+                raise HTTPException(
+                    status_code=400, 
+                    detail="Operator can only reject bookings that have been approved by manager"
+                )
+        
         # ── Transaction: Reject booking ──
         old_status = booking.status
         
@@ -619,29 +680,30 @@ async def reject_booking(
         booking.updated_at = datetime.utcnow()
         
         # 2. Add history entry
+        rejected_by = "manager" if is_manager_role else "operator"
         history = BookingHistory(
             booking_request_id=booking_id,
             status_from=old_status,
             status_to='REJECTED',
             changed_by=admin_id,
-            notes=f"Rejected: {body.reason.strip()}",
+            notes=f"Rejected by {rejected_by}: {body.reason.strip()}",
             changed_at=datetime.utcnow()
         )
         db.add(history)
         
-        # 3. Log admin action
-        _log_admin_action(
-            db=db,
-            admin_id=admin_id,
-            action_type='REJECT',
-            entity_type='BOOKING',
-            entity_id=booking_id,
-            details={
-                "reason": body.reason.strip(),
-                "previous_status": old_status
-            },
-            request=request
-        )
+        # 3. Log admin action (disabled for now)
+        # _log_admin_action(
+        #     db=db,
+        #     admin_id=admin_id,
+        #     action_type='REJECT',
+        #     entity_type='BOOKING',
+        #     entity_id=booking_id,
+        #     details={
+        #         "reason": body.reason.strip(),
+        #         "previous_status": old_status
+        #     },
+        #     request=request
+        # )
         
         db.commit()
         
